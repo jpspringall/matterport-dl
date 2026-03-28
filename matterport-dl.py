@@ -1354,7 +1354,58 @@ def getPageId(url):
     return id
 
 
+def get_available_models(base_dir):
+    """Scan base_dir for downloaded model directories and return metadata."""
+    models = []
+    if not os.path.exists(base_dir):
+        return models
+    for entry in sorted(os.listdir(base_dir)):
+        entry_path = os.path.join(base_dir, entry)
+        if not os.path.isdir(entry_path) or os.path.islink(entry_path):
+            continue
+        info = {"id": entry, "title": "", "alias": ""}
+        run_args_path = os.path.join(entry_path, RUN_ARGS_CONFIG_NAME)
+        if os.path.exists(run_args_path):
+            try:
+                with open(run_args_path, "r", encoding="UTF-8") as f:
+                    data = json.load(f)
+                info["title"] = data.get("TITLE", "")
+                info["alias"] = data.get("ALIAS", "")
+            except (json.JSONDecodeError, OSError):
+                pass
+        models.append(info)
+    models.sort(key=lambda m: (m["title"] or m["id"]).lower())
+    return models
+
+
+def _build_model_listing_html(models, served_base_url):
+    """Build HTML listing page for all available models."""
+    rows = ""
+    for m in models:
+        display = m["id"]
+        parts = []
+        if m["alias"]:
+            parts.append(m["alias"])
+        if m["title"]:
+            parts.append(m["title"])
+        if parts:
+            display = " - ".join(parts) + f' <span style="color:#888">({m["id"]})</span>'
+        rows += f'<tr><td style="padding:8px 16px"><a href="/{m["id"]}/">{display}</a></td></tr>\n'
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Matterport Models</title>
+<style>body{{font-family:system-ui,sans-serif;margin:40px auto;max-width:800px}}
+a{{color:#1a73e8;text-decoration:none}}a:hover{{text-decoration:underline}}
+table{{border-collapse:collapse;width:100%}}tr:hover{{background:#f5f5f5}}</style>
+</head><body>
+<h1>Downloaded Matterport Models</h1>
+<p>{len(models)} model(s) available. <a href="/api/models">JSON API</a></p>
+<table>{rows}</table>
+</body></html>"""
+
+
 class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
+    models_base_dir = ""  # absolute path to downloads folder, set before serve_forever()
+
     def send_error(self, code, message=None, explain=None):
         if code == 404:
             consoleLog(f"###### 404 error: {self.path} may not be downloading everything right", logging.WARNING)
@@ -1390,6 +1441,50 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         raw_path, _, query = self.path.partition("?")
         return query
 
+    def _extract_model_id(self, path):
+        """Extract model_id prefix from path. Returns (model_id, remaining_path) or (None, path)."""
+        # Strip leading slash, split on next slash
+        stripped = path.lstrip("/")
+        if not stripped:
+            return None, path
+        parts = stripped.split("/", 1)
+        candidate = parts[0]
+        # Model IDs are 5-25 alphanumeric characters
+        if candidate.isalnum() and 5 <= len(candidate) <= 25:
+            model_dir = os.path.join(self.models_base_dir, candidate)
+            # Also resolve symlink aliases
+            if os.path.isdir(model_dir):
+                remaining = "/" + parts[1] if len(parts) > 1 else "/"
+                return candidate, remaining
+        return None, path
+
+    def _model_file_path(self, model_id, relative_path):
+        """Resolve a relative path (starting with /) to an absolute path within a model directory."""
+        # Strip leading slash for os.path.join
+        clean = relative_path.lstrip("/")
+        return os.path.join(self.models_base_dir, model_id, clean)
+
+    def _serve_bytes(self, content, content_type="text/html; charset=UTF-8", code=200):
+        """Send a complete response with the given bytes content."""
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _serve_model_listing(self):
+        """Serve the HTML listing of all available models."""
+        models = get_available_models(self.models_base_dir)
+        html = _build_model_listing_html(models, SERVED_BASE_URL)
+        self._serve_bytes(html)
+
+    def _serve_models_json(self):
+        """Serve JSON array of available models."""
+        models = get_available_models(self.models_base_dir)
+        self._serve_bytes(json.dumps(models), content_type="application/json")
+
     def do_GET(self):
         global BASE_MATTERPORTDL_DIR
         redirect_msg = None
@@ -1397,16 +1492,42 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         if not CLA.getCommandLineArg(CommandLineArg.TILDE):
             self.path = self.path.replace("~", "_")
 
+        raw_path = self.getRawPath()
+
+        # Root listing page
+        if raw_path in ("/", "/index.html"):
+            self._serve_model_listing()
+            return
+
+        # JSON API for available models
+        if raw_path == "/api/models":
+            self._serve_models_json()
+            return
+
+        # Extract model_id prefix from path
+        model_id, model_relative_path = self._extract_model_id(self.path)
+        if model_id is None:
+            self.send_error(404, "Not Found")
+            return
+
+        # Rewrite self.path to the model-relative portion for downstream logic
+        self.path = model_relative_path
+        if not CLA.getCommandLineArg(CommandLineArg.TILDE):
+            self.path = self.path.replace("~", "_")
+
         orig_raw_path = raw_path = self.getRawPath()
         query = self.getQuery()
+
+        # GraphQL API requests
         if urlparse(self.path).path == "/api/mp/models/graph":
             query_args = urllib.parse.parse_qs(query)
-            self.do_GraphRequest(query_args.get("operationName", [None])[0])
+            self.do_GraphRequest(query_args.get("operationName", [None])[0], model_id)
             return
 
         if raw_path.endswith("/"):
             raw_path += "index.html"
 
+        # JSNetProxy.js — always served from the repo root
         if raw_path.startswith("/JSNetProxy.js"):
             consoleDebugLog("Using our javascript network proxier", loglevel=logging.INFO)
             self.send_response(200)
@@ -1415,10 +1536,12 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(f.read().encode("utf-8"))
                 return
 
-        if raw_path.startswith("/locale/messages/strings_") and not os.path.exists(f".{raw_path}"):
+        # Locale fallback — resolve against model directory
+        if raw_path.startswith("/locale/messages/strings_") and not os.path.exists(self._model_file_path(model_id, raw_path)):
             redirect_msg = "original request was for a locale we do not have downloaded"
             raw_path = "/locale/strings.json"
 
+        # Crop texture handling — resolve against model directory
         if "crop=" in query and raw_path.endswith(".jpg"):
             query_args = urllib.parse.parse_qs(query)
             crop_addition = query_args.get("crop", None)
@@ -1433,7 +1556,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
             else:
                 width_addition = ""
             test_path = raw_path + width_addition + crop_addition + ".jpg"
-            if os.path.exists(f".{test_path}"):
+            if os.path.exists(self._model_file_path(model_id, test_path)):
                 raw_path = test_path
                 redirect_msg = "dollhouse/floorplan texture request that we have downloaded, better than generic texture file"
             else:
@@ -1443,13 +1566,43 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
             self.path = raw_path
         if self.isPotentialModifiedFile():
             posFile = getModifiedName(self.path)
-            if os.path.exists(posFile[1:]):
+            if os.path.exists(self._model_file_path(model_id, posFile)):
                 self.path = posFile
                 redirect_msg = "modified version exists"
 
         if redirect_msg is not None or orig_request != self.path:
-            consoleDebugLog(f"Redirecting {orig_request} => {self.path} as {redirect_msg}", loglevel=logging.INFO)
+            consoleDebugLog(f"Redirecting {orig_request} => /{model_id}{self.path} as {redirect_msg}", loglevel=logging.INFO)
+
+        # On-the-fly _ProxyBase rewrite for index.modified.html
+        if self.getRawPath().endswith("index.modified.html"):
+            file_on_disk = self._model_file_path(model_id, self.getRawPath())
+            if os.path.exists(file_on_disk):
+                with open(file_on_disk, "r", encoding="UTF-8") as f:
+                    content = f.read()
+                content = content.replace(
+                    "window._ProxyBase=window.location.origin",
+                    f'window._ProxyBase=window.location.origin+"/{model_id}"',
+                )
+                self._serve_bytes(content)
+                return
+
+        # Store model_id for translate_path to use
+        self._current_model_id = model_id
         SimpleHTTPRequestHandler.do_GET(self)
+
+    def translate_path(self, path):
+        """Override to resolve paths within the correct model directory."""
+        model_id = getattr(self, "_current_model_id", None)
+        if model_id:
+            # Strip query string and fragment
+            path = path.split("?", 1)[0].split("#", 1)[0]
+            # Normalize path separators and prevent directory traversal
+            path = os.path.normpath(path)
+            # Remove leading slash / dots
+            while path.startswith(("/", os.sep)):
+                path = path[1:]
+            return os.path.join(self.models_base_dir, model_id, path)
+        return SimpleHTTPRequestHandler.translate_path(self, path)
 
     def isPotentialModifiedFile(self):
         posModifiedExt = ["js", "json", "html"]
@@ -1459,13 +1612,16 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
                 return True
         return False
 
-    def do_GraphRequest(self, option_name: str):
+    def do_GraphRequest(self, option_name: str, model_id: str = ""):
         post_msg = None
         logLevel = logging.INFO
         if option_name in GRAPH_DATA_REQ:
             self.send_response(200)
             self.end_headers()
-            file_path = f"api/mp/models/graph_{option_name}.json"
+            if model_id:
+                file_path = self._model_file_path(model_id, f"api/mp/models/graph_{option_name}.json")
+            else:
+                file_path = f"api/mp/models/graph_{option_name}.json"
             if os.path.exists(file_path):
                 with open(file_path, "r", encoding="UTF-8") as f:
                     self.wfile.write(f.read().encode("utf-8"))
@@ -1482,12 +1638,15 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         post_msg = None
         logLevel = logging.INFO
         try:
-            if urlparse(self.path).path == "/api/mp/models/graph":
+            # Extract model_id for POST requests too
+            model_id, model_relative_path = self._extract_model_id(self.path)
+            check_path = model_relative_path if model_id else self.path
+            if urlparse(check_path).path == "/api/mp/models/graph":
                 content_len = int(self.headers.get("content-length") or "0")
                 post_body = self.rfile.read(content_len).decode("utf-8")
                 json_body = json.loads(post_body)
                 option_name = json_body["operationName"]
-                self.do_GraphRequest(option_name)
+                self.do_GraphRequest(option_name, model_id or "")
                 return
         except Exception as error:
             logLevel = logging.ERROR
@@ -1561,26 +1720,40 @@ def RegisterWindowsBrowsers():
 
 def startServer(baseDir, pageId, browserLaunch, bindAddress, bindPort):
     global SERVED_BASE_URL
-    twinDir = getPageId(pageId)
-    if not os.path.exists(twinDir):
-        fullPath = os.path.abspath(twinDir)
-        relativeToScriptDir = os.path.join(BASE_MATTERPORTDL_DIR, baseDir, twinDir)
-        if os.path.exists(relativeToScriptDir):
-            os.chdir(relativeToScriptDir)
-        else:
-            raise Exception(f"Unable to change to download directory for twin of: {fullPath} or {os.path.abspath(relativeToScriptDir)} make sure the download is there")
+
+    # Resolve the absolute path to the downloads base directory
+    if os.path.isabs(baseDir):
+        models_dir = baseDir
     else:
-        os.chdir(twinDir)
+        models_dir = os.path.join(BASE_MATTERPORTDL_DIR, baseDir)
+    models_dir = os.path.abspath(models_dir)
+
+    if not os.path.isdir(models_dir):
+        raise Exception(f"Downloads directory does not exist: {models_dir}")
+
+    # If a specific model was requested, validate it exists
+    if pageId:
+        model_path = os.path.join(models_dir, pageId)
+        if not os.path.isdir(model_path):
+            raise Exception(f"Model directory not found: {model_path} — make sure the download is there")
+
+    # Set the handler's base directory for multi-model serving
+    OurSimpleHTTPRequestHandler.models_base_dir = models_dir
+
     try:
-        logging.basicConfig(filename="server.log", filemode="w", encoding="utf-8", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        log_path = os.path.join(models_dir, "server.log")
+        logging.basicConfig(filename=log_path, filemode="w", encoding="utf-8", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     except ValueError:
-        logging.basicConfig(filename="server.log", filemode="w", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        logging.basicConfig(filename=log_path, filemode="w", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     if CLA.getCommandLineArg(CommandLineArg.CONSOLE_LOG):
         logging.getLogger().addHandler(logging.StreamHandler())
 
-    logging.info(f"Server starting up {sys_info()}")
-    SERVED_BASE_URL = url = f"http://{bindAddress}:{bindPort}"
+    models = get_available_models(models_dir)
+    logging.info(f"Server starting up {sys_info()} — serving {len(models)} model(s) from {models_dir}")
+    SERVED_BASE_URL = f"http://{bindAddress}:{bindPort}"
+    url = f"{SERVED_BASE_URL}/{pageId}/" if pageId else SERVED_BASE_URL
+    print(f"Serving {len(models)} model(s) from: {models_dir}")
     print("View in browser: " + url)
     httpd = HTTPServer((bindAddress, bindPort), OurSimpleHTTPRequestHandler)
     if browserLaunch:
@@ -1883,7 +2056,7 @@ def main():
             if len(sys.argv) == argPos:  # if no more args its a download run
                 isDownloadRun = True
         if len(sys.argv) == argPos + 2:  # ip and port left, note if it was an IP above we didn't increment argPos
-            isServerRun = pageId != ""
+            isServerRun = True  # server run with or without a specific model
             bindIp = sys.argv[argPos]
             subProcessArgs.remove(bindIp)
             argPos += 1
@@ -1892,14 +2065,16 @@ def main():
             argPos += 1
             bindPort = int(bindPort)
 
-    if not os.path.exists(os.path.join(baseDir, pageId)) and os.path.exists(pageId) and isServerRun:  # allow old rooted pages to still be served
+    if not os.path.exists(os.path.join(baseDir, pageId)) and os.path.exists(pageId) and isServerRun and pageId:  # allow old rooted pages to still be served
         baseDir = "./"
-    elif isServerRun or isDownloadRun:
+    elif isDownloadRun:
         makeDirs(baseDir)
         os.chdir(baseDir)
+    elif isServerRun:
+        makeDirs(baseDir)
 
-    existingConfigFile = os.path.join(pageId, RUN_ARGS_CONFIG_NAME)
-    if os.path.exists(existingConfigFile):
+    existingConfigFile = os.path.join(baseDir, pageId, RUN_ARGS_CONFIG_NAME) if pageId else ""
+    if existingConfigFile and os.path.exists(existingConfigFile):
         try:
             CLA.LoadFromFile(existingConfigFile)
             CLA.parseArgs()
@@ -1917,15 +2092,13 @@ def main():
                 print_colored(f"{SCRIPT_NAME} --help", bcolors.WARNING)
 
                 pageId = interactiveManagerGetToServe(baseDir, subProcessArgs)
-
-                if pageId:
-                    isServerRun = True
+                isServerRun = True
 
             except ImportError:
                 print("Error: Could not import interactive start from _matterport_interactive.py")
 
         else:
-            print(f"Usage:\n{SCRIPT_NAME} - Interactive terminal UI mode, any options below will still be passed to any downloads or server starts\n{SCRIPT_NAME} [url_or_page_id] - Download mode, to download the digital twin\n{SCRIPT_NAME} [url_or_page_id_or_alias] 127.0.0.1 8080 - Server mode after downloading will serve the twin just and open http://127.0.0.1:8080 in a browser\n\tThe following options apply to the download run options:")
+            print(f"Usage:\n{SCRIPT_NAME} - Interactive terminal UI mode, any options below will still be passed to any downloads or server starts\n{SCRIPT_NAME} [url_or_page_id] - Download mode, to download the digital twin\n{SCRIPT_NAME} 127.0.0.1 8080 - Server mode, serves all downloaded models and opens http://127.0.0.1:8080 in a browser\n{SCRIPT_NAME} [url_or_page_id_or_alias] 127.0.0.1 8080 - Server mode, serves all models and opens the specified model in a browser\n\tThe following options apply to the download run options:")
             print(CLA.getUsageStr())
             print("\tServing options:")
             print(CLA.getUsageStr(forServerNotDownload=True))

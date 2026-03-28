@@ -236,6 +236,7 @@ def interactiveManagerGetToServe(downloadDir, matterportArgs):
         downloads = load_model_data()
 
         print(f"To start/serve a matterport, please {bcolors.BOLD}enter the number or the name{bcolors.ENDC} of the matterport in the list below.")
+        print(f'Press {bcolors.BOLD}Enter{bcolors.ENDC} without a selection to {bcolors.BOLD}serve all models{bcolors.ENDC} and open the listing page.')
         print(f'To {bcolors.BOLD}download{bcolors.ENDC} a matterport, {bcolors.BOLD}enter "download "{bcolors.ENDC} followed by the web address or ID{bcolors.ENDC}')
         print(f'To download {bcolors.BOLD}multiple matterports{bcolors.ENDC}, you can enter multiple web addresses {bcolors.BOLD}separated by " "{bcolors.ENDC}')
         print(f'To {bcolors.BOLD}delete{bcolors.ENDC} a matterport, enter {bcolors.BOLD}"delete "{bcolors.ENDC} followed by the associated number or name.')
@@ -301,13 +302,14 @@ def interactiveManagerGetToServe(downloadDir, matterportArgs):
         elif command == "download":
             for url in arg.split(" "):
                 download(matterportArgs, url)
-        else:  # assume user wants to start/serve it so just make sure it exists
+        else:  # assume user wants to start/serve it
+            if not arg:
+                return ""  # serve all models, open listing page
             model_id = getModelId(arg, keys, downloads)
             if not model_id:
                 handle_model_not_found()
                 continue
-            if model_id:
-                return model_id
+            return model_id
 
 
 def find_matches(text, items):
