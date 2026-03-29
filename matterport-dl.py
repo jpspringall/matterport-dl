@@ -1442,21 +1442,27 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         return query
 
     def _extract_model_id(self, path):
-        """Extract model_id prefix from path. Returns (model_id, remaining_path) or (None, path)."""
+        """Extract model_id prefix from path. Returns (model_id, url_prefix, remaining_path) or (None, None, path).
+        model_id is the real directory name (resolved through symlinks).
+        url_prefix is the original prefix from the URL (may be an alias)."""
         # Strip leading slash, split on next slash
         stripped = path.lstrip("/")
         if not stripped:
-            return None, path
+            return None, None, path
         parts = stripped.split("/", 1)
         candidate = parts[0]
-        # Model IDs are 5-25 alphanumeric characters
-        if candidate.isalnum() and 5 <= len(candidate) <= 25:
+        # Model IDs are 5-25 alphanumeric; aliases may contain hyphens/underscores
+        if re.fullmatch(r'[a-zA-Z0-9_-]{2,50}', candidate):
             model_dir = os.path.join(self.models_base_dir, candidate)
-            # Also resolve symlink aliases
             if os.path.isdir(model_dir):
                 remaining = "/" + parts[1] if len(parts) > 1 else "/"
-                return candidate, remaining
-        return None, path
+                url_prefix = candidate
+                # Resolve symlink aliases to the real model directory name
+                if os.path.islink(model_dir):
+                    real_path = os.path.realpath(model_dir)
+                    candidate = os.path.basename(real_path)
+                return candidate, url_prefix, remaining
+        return None, None, path
 
     def _model_file_path(self, model_id, relative_path):
         """Resolve a relative path (starting with /) to an absolute path within a model directory."""
@@ -1504,14 +1510,34 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
             self._serve_models_json()
             return
 
-        # Extract model_id prefix from path
-        model_id, model_relative_path = self._extract_model_id(self.path)
+        # JSNetProxy.js — always served from the repo root, with or without model prefix
+        if raw_path == "/JSNetProxy.js":
+            consoleDebugLog("Using our javascript network proxier", loglevel=logging.INFO)
+            self.send_response(200)
+            self.end_headers()
+            with open(os.path.join(BASE_MATTERPORTDL_DIR, "JSNetProxy.js"), "r", encoding="UTF-8") as f:
+                self.wfile.write(f.read().encode("utf-8"))
+                return
+
+        # Extract model_id prefix from path (use raw_path to avoid query string confusion)
+        model_id, url_prefix, model_relative_path = self._extract_model_id(raw_path)
         if model_id is None:
             self.send_error(404, "Not Found")
             return
 
+        # If the path is just /<model_or_alias> without a trailing slash, redirect to add it.
+        # This ensures relative asset paths (js/foo.js, css/bar.css) resolve correctly.
+        if model_relative_path == "/" and not raw_path.endswith("/"):
+            query = self.getQuery()
+            location = self.path.split("?")[0] + "/" + ("?" + query if query else "")
+            self.send_response(301)
+            self.send_header("Location", location)
+            self.end_headers()
+            return
+
         # Rewrite self.path to the model-relative portion for downstream logic
-        self.path = model_relative_path
+        query = self.getQuery()
+        self.path = model_relative_path + ("?" + query if query else "")
         if not CLA.getCommandLineArg(CommandLineArg.TILDE):
             self.path = self.path.replace("~", "_")
 
@@ -1527,7 +1553,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         if raw_path.endswith("/"):
             raw_path += "index.html"
 
-        # JSNetProxy.js — always served from the repo root
+        # JSNetProxy.js — always served from the repo root (also handled with model prefix)
         if raw_path.startswith("/JSNetProxy.js"):
             consoleDebugLog("Using our javascript network proxier", loglevel=logging.INFO)
             self.send_response(200)
@@ -1581,7 +1607,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
                     content = f.read()
                 content = content.replace(
                     "window._ProxyBase=window.location.origin",
-                    f'window._ProxyBase=window.location.origin+"/{model_id}"',
+                    f'window._ProxyBase=window.location.origin+"/{url_prefix}"',
                 )
                 self._serve_bytes(content)
                 return
@@ -1639,7 +1665,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         logLevel = logging.INFO
         try:
             # Extract model_id for POST requests too
-            model_id, model_relative_path = self._extract_model_id(self.path)
+            model_id, url_prefix, model_relative_path = self._extract_model_id(self.path)
             check_path = model_relative_path if model_id else self.path
             if urlparse(check_path).path == "/api/mp/models/graph":
                 content_len = int(self.headers.get("content-length") or "0")
